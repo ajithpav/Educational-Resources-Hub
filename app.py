@@ -23,11 +23,40 @@ app = Flask(__name__)
 
 class PDFExtractor:
     def __init__(self):
-        self.pdf_files = [
-            r"C:\Users\Ajithkumar.p\Downloads\books\social.pdf",
-            r"C:\Users\Ajithkumar.p\Downloads\books\tamil.pdf"
-            # Add more books as needed
-        ]
+        # Base directory for all educational content
+        self.base_dir = r"C:\Users\Ajithkumar.p\Downloads\books"
+        
+        # Define grade structure with folders
+        self.grade_structure = {
+            "8": {
+                "folder": os.path.join(self.base_dir, "8th_standard"),
+                "name": "8th Standard"
+            },
+            "9": {
+                "folder": os.path.join(self.base_dir, "9th_standard"),
+                "name": "9th Standard"
+            },
+            "10": {
+                "folder": os.path.join(self.base_dir, "10th_standard"),
+                "name": "10th Standard"
+            },
+            "11": {
+                "folder": os.path.join(self.base_dir, "11th_standard"),
+                "name": "11th Standard"
+            },
+            "12": {
+                "folder": os.path.join(self.base_dir, "12th_standard"),
+                "name": "12th Standard"
+            }
+        }
+        
+        # Create grade folders if they don't exist
+        for grade in self.grade_structure.values():
+            os.makedirs(grade["folder"], exist_ok=True)
+        
+        # Automatically discover PDF files in each grade folder
+        self.pdf_files = self.discover_pdf_files()
+        
         self.tokenizer = None
         self.processor = None
         self.model = None
@@ -51,10 +80,28 @@ class PDFExtractor:
             "literature": ["tamil", "english", "literature", "language", "grammar", "poem", "story"]
         }
         
+        # Track which grade level is currently active for chat
+        self.active_grade = None
+        
         # Initialize models and Pinecone
         self.initialize_model()
         self.initialize_pinecone()
+    
+    def discover_pdf_files(self):
+        """Automatically discover PDF files in each grade folder"""
+        pdf_files = []
         
+        for grade_key, grade_info in self.grade_structure.items():
+            folder = grade_info["folder"]
+            if os.path.exists(folder):
+                for filename in os.listdir(folder):
+                    if filename.lower().endswith('.pdf'):
+                        full_path = os.path.join(folder, filename)
+                        pdf_files.append(full_path)
+                        logger.info(f"Discovered PDF: {full_path} for grade {grade_key}")
+        
+        return pdf_files
+    
     def initialize_model(self):
         """Initialize the CLIP model, tokenizer and processor"""
         try:
@@ -109,6 +156,34 @@ class PDFExtractor:
             logger.error(f"Error initializing Pinecone: {str(e)}")
             raise
     
+    def determine_grade_and_subject(self, pdf_path):
+        """Determine grade level and subject based on file path and name"""
+        filename = os.path.basename(pdf_path).lower()
+        filepath = os.path.dirname(pdf_path).lower()
+        
+        # Determine grade level from the folder structure
+        grade_level = None
+        for grade_key, grade_info in self.grade_structure.items():
+            if grade_info["folder"].lower() in filepath:
+                grade_level = grade_info["name"]
+                break
+                
+        # If not found in path, try from filename
+        if not grade_level:
+            for grade in self.grade_levels:
+                if grade in filename or f"standard{grade}" in filename or f"std{grade}" in filename:
+                    grade_level = self.grade_levels[grade]
+                    break
+        
+        # Determine subject
+        subject = None
+        for subj, keywords in self.subjects.items():
+            if any(keyword in filename for keyword in keywords):
+                subject = subj
+                break
+                
+        return grade_level, subject
+    
     def extract_text_and_images_from_pdf(self, pdf_path):
         """Extract text and images from PDF files with enhanced metadata"""
         try:
@@ -116,22 +191,8 @@ class PDFExtractor:
             document = fitz.open(pdf_path)
             content_blocks = []
             
-            # Try to determine grade level and subject from filename
-            filename = os.path.basename(pdf_path).lower()
-            grade_level = None
-            subject = None
-            
-            # Extract grade level
-            for grade in self.grade_levels:
-                if grade in filename or f"standard{grade}" in filename or f"std{grade}" in filename:
-                    grade_level = self.grade_levels[grade]
-                    break
-            
-            # Extract subject
-            for subj, keywords in self.subjects.items():
-                if any(keyword in filename for keyword in keywords):
-                    subject = subj
-                    break
+            # Determine grade level and subject from file path and name
+            grade_level, subject = self.determine_grade_and_subject(pdf_path)
             
             for page_num, page in enumerate(document):
                 # Extract text - break into meaningful chunks by paragraphs
@@ -228,11 +289,25 @@ class PDFExtractor:
             logger.error(f"Error generating embeddings: {str(e)}")
             return None
     
-    def index_pdf_files(self):
-        """Process and index all PDF files"""
+    def index_pdf_files(self, grade_level=None):
+        """Process and index all PDF files, optionally filtering by grade level"""
         total_indexed = 0
         
-        for pdf_file in self.pdf_files:
+        # Filter PDF files by grade level if specified
+        files_to_process = []
+        if grade_level:
+            grade_folder = None
+            for grade_key, grade_info in self.grade_structure.items():
+                if grade_info["name"] == grade_level:
+                    grade_folder = grade_info["folder"].lower()
+                    break
+            
+            if grade_folder:
+                files_to_process = [pdf for pdf in self.pdf_files if grade_folder in pdf.lower()]
+        else:
+            files_to_process = self.pdf_files
+        
+        for pdf_file in files_to_process:
             try:
                 if not os.path.exists(pdf_file):
                     logger.error(f"PDF file not found: {pdf_file}")
@@ -412,22 +487,38 @@ class PDFExtractor:
             "sources": sources
         }
     
+    def set_active_grade(self, grade_level):
+        """Set the active grade level for subsequent chat interactions"""
+        self.active_grade = grade_level
+        logger.info(f"Active grade level set to: {grade_level}")
+        return {"status": "success", "message": f"Active grade level set to {grade_level}"}
+    
     def get_chat_response(self, query, grade_level=None):
         """Process a student query and return an educational response"""
+        # Use active grade if set and no specific grade provided
+        if not grade_level and self.active_grade:
+            grade_level = self.active_grade
+            logger.info(f"Using active grade level: {grade_level}")
+        
         # Search for relevant content
         results = self.search(query, grade_level=grade_level)
         
         # Format the response for educational purposes
         formatted_response = self.format_educational_response(results, query, grade_level)
         
+        # Add grade-specific introduction if applicable
+        if grade_level:
+            grade_intro = f"Based on the {grade_level} curriculum: "
+            formatted_response["answer"] = grade_intro + formatted_response["answer"]
+        
         # Add related questions based on search results
-        related_questions = self.generate_related_questions(results, query)
+        related_questions = self.generate_related_questions(results, query, grade_level)
         formatted_response["related_questions"] = related_questions
         
         return formatted_response
     
-    def generate_related_questions(self, results, original_query):
-        """Generate related questions based on search results"""
+    def generate_related_questions(self, results, original_query, grade_level=None):
+        """Generate related questions based on search results and grade level"""
         related_questions = []
         
         # Extract key topics from content
@@ -443,24 +534,35 @@ class PDFExtractor:
                     if len(word) > 3 and word not in original_query.lower():
                         topics.add(word)
         
-        # Generate 3 related questions
-        if "what" in original_query.lower():
-            if topics:
-                topic = list(topics)[0]
-                related_questions.append(f"How is {topic} used in real life?")
+        # Generate grade-appropriate related questions
+        if grade_level:
+            if grade_level in ["8th Standard", "9th Standard"]:
+                # Simpler questions for younger students
+                if topics:
+                    topic = list(topics)[0] if topics else "this topic"
+                    related_questions.append(f"What is {topic} used for?")
+                    if len(topics) > 1:
+                        topic2 = list(topics)[1]
+                        related_questions.append(f"Can you give an example of {topic2}?")
+            else:
+                # More complex questions for older students
+                if topics:
+                    topic = list(topics)[0] if topics else "this concept"
+                    related_questions.append(f"How does {topic} relate to real-world applications?")
+                    if len(topics) > 1:
+                        topic2 = list(topics)[1]
+                        related_questions.append(f"What are the theoretical foundations of {topic2}?")
         
-        if "how" in original_query.lower():
-            if topics:
-                topic = list(topics)[min(1, len(topics)-1)]
-                related_questions.append(f"What are the key features of {topic}?")
-        
-        if len(topics) > 2:
-            topic = list(topics)[min(2, len(topics)-1)]
-            related_questions.append(f"Can you explain {topic} with examples?")
-        
-        # Add a default question if we couldn't generate enough
+        # Add general questions if we don't have enough
         if len(related_questions) < 2:
-            related_questions.append("Can you explain this topic in more detail?")
+            if "what" in original_query.lower():
+                related_questions.append("How can this be applied in practical situations?")
+            if "how" in original_query.lower():
+                related_questions.append("What are the key principles behind this?")
+            
+            # If still not enough, add a default
+            if len(related_questions) < 2:
+                related_questions.append("Could you explain this in more detail?")
         
         return related_questions[:3]  # Return top 3 related questions
 
@@ -479,10 +581,40 @@ def index_pdfs():
         if extractor is None:
             extractor = PDFExtractor()
         
-        total_indexed = extractor.index_pdf_files()
-        return jsonify({"status": "success", "message": f"Indexed {total_indexed} content blocks from PDFs"})
+        # Get optional grade level filter from request
+        data = request.get_json() or {}
+        grade_level = data.get('grade_level')
+        
+        total_indexed = extractor.index_pdf_files(grade_level=grade_level)
+        
+        message = f"Indexed {total_indexed} content blocks"
+        if grade_level:
+            message += f" for {grade_level}"
+        
+        return jsonify({"status": "success", "message": message})
     except Exception as e:
         logger.error(f"Error in index-pdfs endpoint: {str(e)}")
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+@app.route('/set-grade', methods=['POST'])
+def set_grade():
+    """Set the active grade level for subsequent chat interactions"""
+    global extractor
+    
+    try:
+        if extractor is None:
+            extractor = PDFExtractor()
+        
+        data = request.get_json()
+        grade_level = data.get('grade_level')
+        
+        if not grade_level:
+            return jsonify({"status": "error", "message": "Grade level is required"}), 400
+        
+        result = extractor.set_active_grade(grade_level)
+        return jsonify(result)
+    except Exception as e:
+        logger.error(f"Error in set-grade endpoint: {str(e)}")
         return jsonify({"status": "error", "message": str(e)}), 500
 
 @app.route('/search', methods=['POST'])
@@ -573,6 +705,50 @@ def get_grade_levels():
         })
     except Exception as e:
         logger.error(f"Error in get-grade-levels endpoint: {str(e)}")
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+@app.route('/list-books', methods=['GET'])
+def list_books():
+    """List available books by grade level"""
+    global extractor
+    
+    try:
+        if extractor is None:
+            extractor = PDFExtractor()
+        
+        grade_level = request.args.get('grade_level')
+        
+        books_by_grade = {}
+        
+        for grade_key, grade_info in extractor.grade_structure.items():
+            grade_name = grade_info["name"]
+            folder = grade_info["folder"]
+            
+            if not grade_level or grade_name == grade_level:
+                books = []
+                if os.path.exists(folder):
+                    for filename in os.listdir(folder):
+                        if filename.lower().endswith('.pdf'):
+                            # Try to determine subject
+                            subject = None
+                            for subj, keywords in extractor.subjects.items():
+                                if any(keyword in filename.lower() for keyword in keywords):
+                                    subject = subj
+                                    break
+                            
+                            books.append({
+                                "filename": filename,
+                                "subject": subject
+                            })
+                
+                books_by_grade[grade_name] = books
+        
+        return jsonify({
+            "status": "success",
+            "books": books_by_grade
+        })
+    except Exception as e:
+        logger.error(f"Error in list-books endpoint: {str(e)}")
         return jsonify({"status": "error", "message": str(e)}), 500
 
 if __name__ == '__main__':
